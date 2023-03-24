@@ -5,7 +5,7 @@ The official implementation of the paper
 MULTI-TEMPLATE TRACKER DRIVEN BY CACHE MANAGER ALGORITHM, TOWARDS MULTI-DISTRACTOR SCENARIOS
 
 This repository is based on pytracking and Stark. 
-see https://github.com/visionml/pytracking and https://github.com/researchmm/Stark for more help.
+See https://github.com/visionml/pytracking and https://github.com/researchmm/Stark for more help.
 
 # Dataset
 
