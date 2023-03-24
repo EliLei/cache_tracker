@@ -1,0 +1,111 @@
+from . import BaseActor
+from lib.utils.misc import NestedTensor
+from lib.utils.box_ops import box_cxcywh_to_xyxy, box_xywh_to_xyxy
+import torch
+from lib.utils.merge import merge_template_search
+from ...models.cache_tracker.membank import MemoryBank
+from einops import rearrange
+
+class CACHETActor(BaseActor):
+    """ Actor for training the STARK-S and STARK-ST(Stage1)"""
+    def __init__(self, net, objective, loss_weight, settings):
+        super().__init__(net, objective)
+        self.loss_weight = loss_weight
+        self.settings = settings
+        self.bs = self.settings.batchsize  # batch size
+        self.mem_size = settings.mem_size
+        self.mem_threshold = settings.mem_threshold
+        self.feature_dim = settings.feature_dim
+
+    def __call__(self, data):
+        """
+        args:
+            data - The input data, should contain the fields 'template', 'search', 'gt_bbox'.
+            template_images: (N_t, batch, 3, H, W)
+            search_images: (N_s, batch, 3, H, W)
+        returns:
+            loss    - the training loss
+            status  -  dict containing detailed losses
+        """
+        # forward pass
+        out_dict = self.forward_pass(data, run_box_head=True, run_cls_head=False)
+
+        # process the groundtruth
+        gt_bboxes = data['search_anno']  # (Ns, batch, 4) (x1,y1,w,h)
+
+        # compute losses
+        loss, status = self.compute_losses(out_dict, gt_bboxes[0])
+
+        return loss, status
+
+    def forward_pass(self, data, run_box_head, run_cls_head):
+        feat_dict_list = []
+
+        # def __init__(self, max_size=128, threshold=(0.7,0.7), simfun='cos', batch_size = 16, feature_dim=256, device='cpu'):
+        mem = MemoryBank(max_size=self.mem_size, threshold=self.mem_threshold,batch_size=self.bs, feature_dim=self.feature_dim, device=self.settings.device)
+        #self.mem_size
+        #self.mem_threshold
+
+        # data['template_images'] (D,B,C,H,W)
+        # data['template_att'] (D,B,H,W)
+
+        # process the templates
+        #import time
+        #torch.cuda.synchronize(self.settings.device)
+        #start = time.time()
+        with torch.no_grad():
+            template_img_i = data['template_images'].view(-1, *data['template_images'].shape[2:]) # db c h e
+            template_att_i = data['template_att'].view(-1, *data['template_att'].shape[2:]) # db c h e
+            d = self.net(img=NestedTensor(template_img_i, template_att_i), mode='backbone')
+            # ('feat', torch.Size([64, 16, 256])),
+            #  ('mask', torch.Size([16, 64])),
+            #  ('pos', torch.Size([64, 16, 256]))
+            feat = rearrange(d['feat'],'s (d b) c-> d s b c',d=self.settings.num_template, b=self.bs)
+            mask = rearrange(d['mask'], '(d b) s -> d b s', d=self.settings.num_template, b=self.bs)
+            pos = rearrange(d['pos'], 's (d b) c -> d s b c', d=self.settings.num_template, b=self.bs)
+
+            for i in range(self.settings.num_template):
+                mem.update(feat[i], mask[i], pos[i], i)
+        feat_dict_list.append(mem.get()) # (D,B,HW)
+        #torch.cuda.synchronize(self.settings.device)
+        #end = time.time()
+        #print('memtime',end-start)
+
+        # process the search regions (t-th frame)
+        search_img = data['search_images'].view(-1, *data['search_images'].shape[2:])  # (batch, 3, 320, 320)
+        search_att = data['search_att'].view(-1, *data['search_att'].shape[2:])  # (batch, 320, 320)
+        feat_dict_list.append(self.net(img=NestedTensor(search_img, search_att), mode='backbone'))
+
+        # run the transformer and compute losses
+        seq_dict = merge_template_search(feat_dict_list)
+        out_dict, _, _ = self.net(seq_dict=seq_dict, mode="transformer", run_box_head=run_box_head, run_cls_head=run_cls_head)
+        # out_dict: (B, N, C), outputs_coord: (1, B, N, C), target_query: (1, B, N, C)
+        return out_dict
+
+    def compute_losses(self, pred_dict, gt_bbox, return_status=True):
+        # Get boxes
+        pred_boxes = pred_dict['pred_boxes']
+        if torch.isnan(pred_boxes).any():
+            raise ValueError("Network outputs is NAN! Stop Training")
+        num_queries = pred_boxes.size(1)
+        pred_boxes_vec = box_cxcywh_to_xyxy(pred_boxes).view(-1, 4)  # (B,N,4) --> (BN,4) (x1,y1,x2,y2)
+        gt_boxes_vec = box_xywh_to_xyxy(gt_bbox)[:, None, :].repeat((1, num_queries, 1)).view(-1, 4).clamp(min=0.0, max=1.0)  # (B,4) --> (B,1,4) --> (B,N,4)
+        # compute giou and iou
+        try:
+            giou_loss, iou = self.objective['giou'](pred_boxes_vec, gt_boxes_vec)  # (BN,4) (BN,4)
+        except:
+            giou_loss, iou = torch.tensor(0.0).cuda(), torch.tensor(0.0).cuda()
+        # compute l1 loss
+        l1_loss = self.objective['l1'](pred_boxes_vec, gt_boxes_vec)  # (BN,4) (BN,4)
+        # weighted sum
+        loss = self.loss_weight['giou'] * giou_loss + self.loss_weight['l1'] * l1_loss
+        if return_status:
+            # status for log
+            mean_iou = iou.detach().mean()
+            status = {"Loss/total": loss.item(),
+                      "Loss/giou": giou_loss.item(),
+                      "Loss/l1": l1_loss.item(),
+                      "IoU": mean_iou.item()}
+            return loss, status
+        else:
+            return loss
